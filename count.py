@@ -2,76 +2,85 @@ import os
 import sys
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import tkinter as tk
 from tkinter import filedialog
+from huggingface_hub import hf_hub_download
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
 
-# Load a pre-trained YOLO model (YOLOv8 small is a better accuracy/speed balance than nano)
-model = YOLO('yolov8s.pt')
-
-# Hide the main tkinter root window so only the file dialog appears
+# Hide the main tkinter window so only the file dialog shows
 root = tk.Tk()
 root.withdraw()
 
-# Open a file dialog to choose an image interactively
-print("Please select an image file in the popup window...")
+# Ask the user to pick an image
 image_path = filedialog.askopenfilename(
-    title="Select an Image for Person Counting",
+    title="Select an Image for Head Counting",
     filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp *.webp")]
 )
 root.destroy()
 
-# Check if the user cancelled the dialog
+# Exit if the dialog was cancelled
 if not image_path:
-    print("No file selected. Exiting program.")
-    sys.exit()
+    sys.exit("No file selected.")
 
-print(f"Loaded image from: {image_path}")
-
-# Load your target image (imdecode handles non-ASCII paths on Windows)
+# Load the image (imdecode handles non-ASCII paths on Windows)
 image = cv2.imdecode(np.fromfile(image_path, np.uint8), cv2.IMREAD_COLOR)
-
 if image is None:
-    print(f"Error: Could not load image from {image_path}")
-    sys.exit()
+    sys.exit(f"Could not load {image_path}")
 
-# Run object detection on the image (class 0 corresponds to 'person' in COCO dataset)
-results = model(image, classes=[0], conf=0.3, imgsz=1280, verbose=False)
+# Upscale so small heads get more pixels per tile
+UPSCALE = 3.0 if image.shape[1] < 1200 else 2.0
+big = cv2.resize(image, None, fx=UPSCALE, fy=UPSCALE, interpolation=cv2.INTER_CUBIC)
 
-# Scale drawing sizes to the image width so text is readable on large photos
+# Download the head detection weights (cached after the first run)
+weights = hf_hub_download("wesjos/YOLO-head-detection", "v8m-head.pt")
+
+# Load the head model through SAHI (use device="cpu" if you have no GPU)
+detector = AutoDetectionModel.from_pretrained(
+    model_type="ultralytics",
+    model_path=weights,
+    confidence_threshold=0.35,
+    device="cuda:0",
+)
+
+# Detect on overlapping tiles and merge duplicate boxes
+result = get_sliced_prediction(
+    cv2.cvtColor(big, cv2.COLOR_BGR2RGB),
+    detector,
+    slice_height=512,
+    slice_width=512,
+    overlap_height_ratio=0.25,
+    overlap_width_ratio=0.25,
+    postprocess_type="NMS",
+    postprocess_match_metric="IOU",
+    postprocess_match_threshold=0.4,
+)
+
+# Scale text size with image width
 scale = max(image.shape[1] / 1000, 0.5)
 
-# Extract the bounding boxes for detected people
-person_count = 0
-for result in results:
-    boxes = result.boxes
-    for box in boxes:
-        person_count += 1
+# Count heads and draw their boxes
+count = 0
+for p in result.object_prediction_list:
+    b = p.bbox
+    w, h = b.maxx - b.minx, b.maxy - b.miny
+    if not 0.6 < w / h < 1.6: # Skip weird boxes
+        continue
+    count += 1
+    x1, y1, x2, y2 = [int(v / UPSCALE) for v in (b.minx, b.miny, b.maxx, b.maxy)]
+    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
-        # Get coordinates for the bounding box
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-        # Draw a green rectangle around each detected person
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), max(int(2 * scale), 2))
-
-        # Label each box with a number (clamped so it stays on-screen)
-        cv2.putText(image, str(person_count), (x1, max(y1 - 10, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * scale, (0, 255, 0), max(int(2 * scale), 1))
-
-# Display the total count on the image canvas
-text = f"Total Persons: {person_count}"
-cv2.putText(image, text, (30, int(50 * scale)),
+# Write the total on the image
+cv2.putText(image, f"Total Heads: {count}", (30, int(50 * scale)),
             cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), max(int(3 * scale), 2))
-
-print(f"Total people found: {person_count}")
+print(f"Total heads found: {count}")
 
 # Save the result next to the source image
-output_path = os.path.join(os.path.dirname(image_path), "output_counted.jpg")
-cv2.imwrite(output_path, image)
+out = os.path.join(os.path.dirname(image_path), "output_counted.jpg")
+cv2.imwrite(out, image)
 
-# Show the result in a resizable popup window
-cv2.namedWindow("Person Counter", cv2.WINDOW_NORMAL)
-cv2.imshow("Person Counter", image)
-
+# Show the result in a resizable window
+cv2.namedWindow("Head Counter", cv2.WINDOW_NORMAL)
+cv2.imshow("Head Counter", image)
 cv2.waitKey(0)
 cv2.destroyAllWindows()
